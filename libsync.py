@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import json
@@ -8,6 +7,7 @@ import datetime
 import logging
 import random
 import string
+import time
 
 from samba.auth import system_session
 from samba.credentials import Credentials
@@ -59,15 +59,15 @@ class AdConnect():
         self.dict_az_devices={}
         self.verify=True
 
-    def connect(self):
-        if not self.az:
-            self.az = AADInternals(proxies=self.proxiesconf,
-                                   tenant_id=self.tenant_id,
-                                   entra_aba_dir=self.entra_aba_dir,
-                                   domain=self.domain,
-                                   verify=self.verify)
-            self.az.get_token(scopes=[SYNC_SCOPE])
-            self.tenant_id = self.az.tenant_id
+    # def connect(self):
+    #     if not self.az:
+    #         self.az = AADInternals(proxies=self.proxiesconf,
+    #                                tenant_id=self.tenant_id,
+    #                                entra_aba_dir=self.entra_aba_dir,
+    #                                domain=self.domain,
+    #                                verify=self.verify)
+    #         self.az.get_token(scopes=[SYNC_SCOPE])
+    #         self.tenant_id = self.az.tenant_id
 
 
     def enable_ad_sync(self):
@@ -160,14 +160,92 @@ class AdConnect():
             self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor)
 
     def get_sync_configuration(self):
+        """Read the sync configuration. Right after the Entra application was created,
+        Microsoft's provisioning service may refuse access for a few minutes: wait and
+        retry, but only then."""
         self.connect()
+        deadline = time.monotonic() + 15 * 60
+        attempt = 0
+        while True:
+            try:
+                return self.az.get_syncconfiguration()
+            except Exception as exc:
+                if "Access to Azure Active Directory has been denied" not in str(exc) \
+                        or not self._identity_is_new() or time.monotonic() >= deadline:
+                    raise
+                attempt += 1
+                print("Entra is still applying the permissions of the new application "
+                        "(attempt %d), waiting 30 seconds ..." % attempt, flush=True)
+                time.sleep(30)
+# --- paste into class AdConnect (libsync.py); needs "import time" at the top -------------
+
+    def _new_client(self):
+        client = AADInternals(proxies=self.proxiesconf,
+                              tenant_id=self.tenant_id,
+                              entra_aba_dir=self.entra_aba_dir,
+                              domain=self.domain,
+                              verify=self.verify)
+        client.get_token(scopes=[SYNC_SCOPE])
+        return client
+
+    def connect(self):
+        if not self.az:
+            self.az = self._new_client()
+            self.tenant_id = self.az.tenant_id
+            self._wait_for_new_identity()
+
+    def _identity_is_new(self, max_age_minutes=60):
         try:
-            return self.az.get_syncconfiguration()
-        except Exception as e:
-            if 'Identity synchronization is not yet activated for this company' in str(e):
-                return {'IsDirSyncing':'false', 'DirSyncFeatures':0}
-            raise
-    
+            with open(os.path.join(self.entra_aba_dir, "state.json"), encoding="utf-8") as stream:
+                created = datetime.datetime.fromisoformat(
+                    json.load(stream)["created_at"].replace("Z", "+00:00"))
+        except (OSError, ValueError, KeyError):
+            return False
+        return datetime.datetime.now(datetime.timezone.utc) - created < datetime.timedelta(minutes=max_age_minutes)
+
+    @staticmethod
+    def _permission_pending(exc):
+        """True for the two ways Entra says "not yet": SOAP fault 'denied' and Graph 403."""
+        if "Access to Azure Active Directory has been denied" in str(exc):
+            return True
+        return getattr(getattr(exc, "response", None), "status_code", None) in (401, 403)
+
+    def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30):
+        """A newly created Entra application is not usable at once: for some minutes the
+        sync service answers "denied" and Graph answers 403. Wait until all three calls the
+        sync needs work. Only for an application created in the last hour. Every attempt
+        uses a NEW client, because msal keeps the first access token in memory and that
+        token may have been issued before the roles reached the token service."""
+        if not self._identity_is_new():
+            return
+        deadline = time.monotonic() + timeout_minutes * 60
+        attempt = 0
+        while True:
+            probes = [
+                {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
+                {"name": "groups (Graph)", "call": lambda: self.az.call_graphapi("groups", select="id", top=1)},
+                {"name": "users (Graph)", "call": lambda: self.az.call_graphapi("users", select="id", top=1)},
+            ]
+            pending = []
+            for probe in probes:
+                try:
+                    probe["call"]()
+                except Exception as exc:
+                    if not self._permission_pending(exc):
+                        raise
+                    pending.append(probe["name"])
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Entra has not activated the permissions of the new application "
+                                   "after %d minutes (still pending: %s)" % (timeout_minutes, ", ".join(pending)))
+            attempt += 1
+            print("Entra is still applying the permissions of the new application "
+                  "(attempt %d, waiting for: %s), retrying in %d seconds ..."
+                  % (attempt, ", ".join(pending), interval_seconds), flush=True)
+            time.sleep(interval_seconds)
+            self.az = self._new_client()
+
     def identity_ready(self):
         base = Path(self.entra_aba_dir).expanduser().resolve()
         state = read_state(base)
